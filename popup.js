@@ -194,6 +194,16 @@
             if (details.ocspStapling !== undefined) {
               result.ocspStapling = details.ocspStapling;
             }
+            // PQC (Post-Quantum Cryptography) key exchange detection
+            if (details.namedGroups) {
+              // NIST PQC finalists / hybrids: ML-KEM (Kyber), NTRU, SABER, BIKE, HQC
+              const PQC_PATTERNS = ['MLKEM', 'KYBER', 'NTRU', 'SABER', 'BIKE', 'HQC'];
+              result.pqcKeyExchange = details.namedGroups
+                .filter(g => g.name && PQC_PATTERNS.some(p => g.name.toUpperCase().includes(p)))
+                .map(g => g.name);
+              result.allNamedGroups = details.namedGroups
+                .map(g => g.name || null).filter(Boolean);
+            }
             // Vulnerability detection from SSL Labs data
             result.vulns = [];
             if (details.heartbleed) result.vulns.push('Heartbleed');
@@ -224,6 +234,9 @@
             issuer: c.issuerSubject || null
           }))
         };
+        // PQC certificate signature algorithm (ML-DSA / SLH-DSA / Falcon / Dilithium / SPHINCS+)
+        const sigAlg = leaf.sigAlg || '';
+        result.pqcCertSig = /ML-DSA|SLH-DSA|Falcon|Dilithium|SPHINCS/i.test(sigAlg);
       }
     }
 
@@ -524,6 +537,52 @@
     for (const vuln of data.vulns) {
       content.appendChild(createInfoRow('fail', vuln, '脆弱性あり'));
     }
+  }
+
+  function renderPqc(data) {
+    const section = document.getElementById('pqc-section');
+    const content = document.getElementById('pqc-content');
+
+    // Show section only if SSL Labs data was available (pqcKeyExchange is set)
+    if (!data || data.pqcKeyExchange === undefined) {
+      section.hidden = true;
+      return;
+    }
+
+    section.hidden = false;
+    content.innerHTML = '';
+
+    // Key exchange
+    if (data.pqcKeyExchange.length > 0) {
+      content.appendChild(createInfoRow('pass', '鍵交換 (KEX)', data.pqcKeyExchange.join(', ')));
+    } else {
+      const classical = data.allNamedGroups && data.allNamedGroups.length > 0
+        ? data.allNamedGroups.slice(0, 3).join(', ')
+        : '古典暗号のみ';
+      content.appendChild(createInfoRow('fail', '鍵交換 (KEX)', `未対応（${classical}）`));
+    }
+
+    // Certificate signature algorithm
+    if (data.pqcCertSig !== undefined) {
+      content.appendChild(createInfoRow(
+        data.pqcCertSig ? 'pass' : 'neutral',
+        '証明書署名',
+        data.pqcCertSig ? 'PQC署名アルゴリズム使用' : '古典アルゴリズム (RSA / ECDSA)'
+      ));
+    }
+
+    // Overall verdict
+    const kexOk = data.pqcKeyExchange.length > 0;
+    const certOk = data.pqcCertSig === true;
+    let verdict, verdictStatus;
+    if (kexOk && certOk) {
+      verdictStatus = 'pass'; verdict = '完全対応';
+    } else if (kexOk) {
+      verdictStatus = 'pass'; verdict = 'ハイブリッド鍵交換対応';
+    } else {
+      verdictStatus = 'fail'; verdict = '未対応';
+    }
+    content.appendChild(createInfoRow(verdictStatus, '総合評価', verdict));
   }
 
   function renderEmailAuth(auth) {
@@ -1306,6 +1365,7 @@
       renderEncryption(encryption);
       renderCert(encryption?.cert || null);
       renderVulnerabilities(encryption);
+      renderPqc(encryption);
       renderSecurityHeaders(secHeaders);
       renderInfoLeakage(secHeaders);
       renderCookies(cookies);
