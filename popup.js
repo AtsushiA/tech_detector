@@ -112,7 +112,7 @@
 
     const domain = getRegisteredDomain(new URL(tabUrl).hostname);
 
-    const [httpResult, headResp, sslData] = await Promise.all([
+    const [httpResult, headResp, sslData, hstsPreloadData] = await Promise.all([
       // HTTP protocol version from content script
       api.scripting.executeScript({
         target: { tabId },
@@ -122,12 +122,18 @@
         }
       }).catch(() => [{ result: '' }]),
 
-      // HSTS from HEAD response
+      // HSTS + Expect-CT from HEAD response
       fetch(tabUrl, { method: 'HEAD' }).catch(() => null),
 
       // SSL Labs cached TLS data (4s timeout)
       fetchWithTimeout(
         `https://api.ssllabs.com/api/v3/analyze?host=${domain}&fromCache=on&all=done`,
+        4000
+      ).then(r => r.ok ? r.json() : null).catch(() => null),
+
+      // HSTS Preload list status (4s timeout)
+      fetchWithTimeout(
+        `https://hstspreload.org/api/v2/status?domain=${encodeURIComponent(domain)}`,
         4000
       ).then(r => r.ok ? r.json() : null).catch(() => null)
     ]);
@@ -139,9 +145,15 @@
     const protoMap = { 'h2': 'HTTP/2', 'h3': 'HTTP/3', 'http/1.1': 'HTTP/1.1' };
     result.httpVersion = protoMap[proto] || proto || null;
 
-    // HSTS
+    // HSTS + Expect-CT
     if (headResp) {
       result.hsts = headResp.headers.get('strict-transport-security') || null;
+      result.expectCt = headResp.headers.get('expect-ct') || null;
+    }
+
+    // HSTS Preload list
+    if (hstsPreloadData) {
+      result.hstsPreload = hstsPreloadData.status || null; // 'preloaded' | 'pending' | 'unknown'
     }
 
     // SSL Labs
@@ -159,6 +171,10 @@
                 .map(p => p.version)
                 .sort()
                 .reverse();
+              // Detect deprecated protocols (TLS 1.0 / 1.1)
+              result.weakProtocols = details.protocols
+                .filter(p => p.name === 'TLS' && (p.version === '1.0' || p.version === '1.1'))
+                .map(p => `TLS ${p.version}`);
             }
             if (details.suites) {
               const sorted = [...details.suites].sort((a, b) => (b.protocol || 0) - (a.protocol || 0));
@@ -170,11 +186,28 @@
                 }
               }
             }
+            // Forward Secrecy (0=none, 1=some browsers, 2=all browsers, 4=all+SCSV)
+            if (details.forwardSecrecy !== undefined) {
+              result.forwardSecrecy = details.forwardSecrecy;
+            }
+            // OCSP Stapling
+            if (details.ocspStapling !== undefined) {
+              result.ocspStapling = details.ocspStapling;
+            }
+            // Vulnerability detection from SSL Labs data
+            result.vulns = [];
+            if (details.heartbleed) result.vulns.push('Heartbleed');
+            if (details.poodle) result.vulns.push('POODLE (SSL 3.0)');
+            if (details.poodleTls >= 2) result.vulns.push('POODLE TLS');
+            if (details.beast) result.vulns.push('BEAST');
+            if (details.lucky13 === 2) result.vulns.push('Lucky13');
+            if (details.robot >= 3) result.vulns.push('ROBOT');
+            if (details.freak) result.vulns.push('FREAK');
           }
         }
       }
 
-      // Certificate info (leaf cert is first in certs array)
+      // Certificate info (leaf cert + intermediate chain)
       if (sslData.certs && sslData.certs.length > 0) {
         const leaf = sslData.certs[0];
         result.cert = {
@@ -185,7 +218,11 @@
           keySize: leaf.keySize || null,
           notBefore: leaf.notBefore || null,
           notAfter: leaf.notAfter || null,
-          altNames: leaf.altNames || null
+          altNames: leaf.altNames || null,
+          chain: sslData.certs.slice(1).map(c => ({
+            subject: c.subject || null,
+            issuer: c.issuerSubject || null
+          }))
         };
       }
     }
@@ -269,7 +306,27 @@
       content.appendChild(createInfoRow(
         hasTls13 ? 'pass' : 'neutral',
         'TLS',
-        data.tlsVersions.map(v => `${v}`).join(', ')
+        data.tlsVersions.map(v => `TLS ${v}`).join(' / ')
+      ));
+    }
+
+    // Deprecated protocol warning
+    if (data.weakProtocols && data.weakProtocols.length > 0) {
+      content.appendChild(createInfoRow(
+        'fail',
+        '非推奨プロトコル',
+        `${data.weakProtocols.join(' / ')} が有効`
+      ));
+    }
+
+    // Forward Secrecy
+    if (data.forwardSecrecy !== undefined) {
+      const fsMap = { 0: 'なし', 1: '一部対応', 2: '対応', 4: '全対応 (SCSV)' };
+      const fsStatus = data.forwardSecrecy >= 2 ? 'pass' : (data.forwardSecrecy === 1 ? 'neutral' : 'fail');
+      content.appendChild(createInfoRow(
+        fsStatus,
+        '前方秘匿性 (FS)',
+        fsMap[data.forwardSecrecy] ?? '不明'
       ));
     }
 
@@ -292,6 +349,31 @@
       'HSTS',
       data.hsts || '未設定'
     ));
+
+    // HSTS Preload list
+    if (data.hstsPreload) {
+      const preloadStatus = data.hstsPreload === 'preloaded' ? 'pass' : 'neutral';
+      const preloadLabel = { preloaded: 'プリロード済み', pending: '申請中', unknown: '未登録' };
+      content.appendChild(createInfoRow(
+        preloadStatus,
+        'HSTSプリロード',
+        preloadLabel[data.hstsPreload] || '未登録'
+      ));
+    }
+
+    // Expect-CT
+    if (data.expectCt) {
+      content.appendChild(createInfoRow('neutral', 'Expect-CT', data.expectCt));
+    }
+
+    // OCSP Stapling
+    if (data.ocspStapling !== undefined) {
+      content.appendChild(createInfoRow(
+        data.ocspStapling ? 'pass' : 'neutral',
+        'OCSPステープリング',
+        data.ocspStapling ? '有効' : '無効'
+      ));
+    }
   }
 
   function formatCertDate(ms) {
@@ -409,6 +491,38 @@
         ? cert.altNames.join(', ')
         : `${cert.altNames.slice(0, 3).join(', ')} (+${cert.altNames.length - 3})`;
       content.appendChild(createInfoRow('neutral', 'SANs', display));
+    }
+
+    // Certificate chain (intermediate CAs)
+    if (cert.chain && cert.chain.length > 0) {
+      const chainNames = cert.chain
+        .map(c => extractIssuerName(c.subject))
+        .filter(Boolean);
+      if (chainNames.length > 0) {
+        content.appendChild(createInfoRow('neutral', '中間CA', chainNames.join(' → ')));
+      }
+    }
+  }
+
+  function renderVulnerabilities(data) {
+    const section = document.getElementById('vuln-section');
+    const content = document.getElementById('vuln-content');
+
+    if (!data || !data.vulns) {
+      section.hidden = true;
+      return;
+    }
+
+    section.hidden = false;
+    content.innerHTML = '';
+
+    if (data.vulns.length === 0) {
+      content.appendChild(createInfoRow('pass', 'SSL Labs スキャン', '脆弱性は検出されませんでした'));
+      return;
+    }
+
+    for (const vuln of data.vulns) {
+      content.appendChild(createInfoRow('fail', vuln, '脆弱性あり'));
     }
   }
 
@@ -1191,6 +1305,7 @@
 
       renderEncryption(encryption);
       renderCert(encryption?.cert || null);
+      renderVulnerabilities(encryption);
       renderSecurityHeaders(secHeaders);
       renderInfoLeakage(secHeaders);
       renderCookies(cookies);
